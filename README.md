@@ -13,6 +13,14 @@ Every clipboard entry is stored locally in SQLite along with the **working direc
 
 ## Installation
 
+### Via npm (requires Python 3.10+)
+
+```bash
+npm install -g @rxptor-cmd/timeclip
+```
+
+### Via pip
+
 ```powershell
 pip install -e .
 ```
