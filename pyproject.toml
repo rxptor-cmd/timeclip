@@ -10,3 +10,6 @@ requires-python = ">=3.10"
 
 [project.scripts]
 ttc = "main:main"
+
+[tool.setuptools]
+py-modules = ["clipboard_win", "context", "main", "store", "tui"]
