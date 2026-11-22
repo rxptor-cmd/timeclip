@@ -1,0 +1,26 @@
+{
+  "name": "@rxptor-cmd/timeclip",
+  "version": "0.1.0",
+  "description": "Local-first time-travel clipboard for terminals with keyboard and mouse TUI",
+  "bin": {
+    "ttc": "./bin/ttc.js",
+    "timeclip": "./bin/ttc.js"
+  },
+  "files": [
+    "bin/",
+    "*.py",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rxptor-cmd/timeclip.git"
+  },
+  "keywords": [
+    "clipboard",
+    "tui",
+    "terminal",
+    "cli",
+    "git"
+  ],
+  "license": "MIT"
+}
