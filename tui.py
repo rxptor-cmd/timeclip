@@ -6,7 +6,8 @@ import shutil
 import sys
 import threading
 import time
-from typing import List, Optional, Tuple
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple, Union
 
 from clipboard_win import get_clipboard_text, set_clipboard_text
 from context import get_git_branch
@@ -115,11 +116,14 @@ class TimeTravelTUI:
     def __init__(self, store: ClipStore) -> None:
         self.store = store
         self.entries: List[ClipEntry] = []
+        self.display_rows: List[Tuple[str, object]] = []
         self.selected_idx: int = 0
         self.scroll_offset: int = 0
         self.query: str = ""
         self.search_mode: bool = False
         self.filter_mode: str = "all"  # "all" | "pinned" | "branch"
+        self.group_mode: str = "date"  # "none" | "date" | "week" | "branch"
+        self.collapsed_folders: set = set()
         self.current_branch: str = get_git_branch()
         self.status_msg: str = "Ready. Watching clipboard…"
         self.running: bool = True
@@ -130,6 +134,41 @@ class TimeTravelTUI:
         # Clickable UI hitboxes: (y, x1, x2, action_name)
         self.hitboxes: List[Tuple[int, int, int, str]] = []
 
+    def _folder_key(self, entry: ClipEntry) -> str:
+        if self.group_mode == "date":
+            return entry.short_date
+        if self.group_mode == "week":
+            try:
+                dt = datetime.fromisoformat(entry.timestamp).astimezone()
+                iso = dt.isocalendar()
+                return f"{iso.year}-W{iso.week:02d}"
+            except Exception:
+                return entry.short_date[:7]
+        if self.group_mode == "branch":
+            return entry.git_branch or "(no branch)"
+        return ""
+
+    def _rebuild_display_rows(self) -> None:
+        if self.group_mode == "none":
+            self.display_rows = [("entry", e) for e in self.entries]
+        else:
+            groups: Dict[str, List[ClipEntry]] = {}
+            for e in self.entries:
+                key = self._folder_key(e)
+                groups.setdefault(key, []).append(e)
+            self.display_rows = []
+            for key, items in groups.items():
+                self.display_rows.append(("folder", (key, len(items))))
+                if key not in self.collapsed_folders:
+                    for e in items:
+                        self.display_rows.append(("entry", e))
+
+        if not self.display_rows:
+            self.selected_idx = 0
+            self.scroll_offset = 0
+        else:
+            self.selected_idx = max(0, min(self.selected_idx, len(self.display_rows) - 1))
+
     def refresh_entries(self) -> None:
         pinned_only = self.filter_mode == "pinned"
         branch = self.current_branch if self.filter_mode == "branch" else ""
@@ -138,11 +177,7 @@ class TimeTravelTUI:
             pinned_only=pinned_only,
             branch_filter=branch,
         )
-        if not self.entries:
-            self.selected_idx = 0
-            self.scroll_offset = 0
-        else:
-            self.selected_idx = max(0, min(self.selected_idx, len(self.entries) - 1))
+        self._rebuild_display_rows()
 
     def _watch_clipboard(self) -> None:
         last_seen = get_clipboard_text()
@@ -165,27 +200,47 @@ class TimeTravelTUI:
             except Exception:
                 pass
 
+    def _selected_entry(self) -> Optional[ClipEntry]:
+        if not self.display_rows or self.selected_idx >= len(self.display_rows):
+            return None
+        kind, payload = self.display_rows[self.selected_idx]
+        return payload if kind == "entry" else None  # type: ignore[return-value]
+
+    def cycle_group_mode(self) -> None:
+        order = ["date", "week", "branch", "none"]
+        self.group_mode = order[(order.index(self.group_mode) + 1) % len(order)]
+        self.collapsed_folders.clear()
+        self._rebuild_display_rows()
+        self.status_msg = f"Grouped by: {self.group_mode}"
+
     def copy_selected(self) -> None:
-        if not self.entries:
+        entry = self._selected_entry()
+        if not entry:
+            if self.display_rows and self.display_rows[self.selected_idx][0] == "folder":
+                key, _ = self.display_rows[self.selected_idx][1]  # type: ignore[misc]
+                if key in self.collapsed_folders:
+                    self.collapsed_folders.remove(key)
+                else:
+                    self.collapsed_folders.add(key)
+                self._rebuild_display_rows()
             return
-        entry = self.entries[self.selected_idx]
         if set_clipboard_text(entry.content):
             self.status_msg = f"Copied #{entry.id} to clipboard"
         else:
             self.status_msg = "Failed to write to clipboard"
 
     def toggle_pin_selected(self) -> None:
-        if not self.entries:
+        entry = self._selected_entry()
+        if not entry:
             return
-        entry = self.entries[self.selected_idx]
         self.store.toggle_pin(entry.id)
         self.refresh_entries()
         self.status_msg = f"Toggled pin on #{entry.id}"
 
     def delete_selected(self) -> None:
-        if not self.entries:
+        entry = self._selected_entry()
+        if not entry:
             return
-        entry = self.entries[self.selected_idx]
         self.store.delete(entry.id)
         self.refresh_entries()
         self.status_msg = f"Deleted #{entry.id}"
@@ -226,6 +281,10 @@ class TimeTravelTUI:
             self.hitboxes.append((1, x_cursor, x_cursor + len(tag) - 1, f"filter:{mode}"))
             x_cursor += len(tag) + 1
 
+        grp_btn = f"[Group: {self.group_mode}]"
+        self.hitboxes.append((1, x_cursor, x_cursor + len(grp_btn) - 1, "group"))
+        tabs.append(f"{FG_CYAN}{grp_btn}{RESET}")
+
         snap_btn = "[+ Snap]"
         snap_x = cols - len(snap_btn) - 1
         self.hitboxes.append((1, snap_x, snap_x + len(snap_btn) - 1, "snap"))
@@ -252,9 +311,7 @@ class TimeTravelTUI:
         elif self.selected_idx >= self.scroll_offset + body_rows:
             self.scroll_offset = self.selected_idx - body_rows + 1
 
-        selected_entry: Optional[ClipEntry] = (
-            self.entries[self.selected_idx] if self.entries else None
-        )
+        selected_entry: Optional[ClipEntry] = self._selected_entry()
 
         # Prepare right-pane lines
         right_lines: List[str] = []
@@ -293,21 +350,32 @@ class TimeTravelTUI:
         # Render body rows
         for i in range(body_rows):
             screen_y = 4 + i
-            entry_idx = self.scroll_offset + i
+            row_idx = self.scroll_offset + i
 
-            if entry_idx < len(self.entries):
-                e = self.entries[entry_idx]
-                pin_mark = "★" if e.pinned else " "
-                branch_tag = f"[{e.git_branch[:10]}]" if e.git_branch else ""
-                meta = f"{pin_mark}{e.short_time} {branch_tag}".strip()
-                avail = max(6, left_w - len(meta) - 3)
-                row_text = f" {meta} {clip_str(e.preview, avail)}"
-                row_text = clip_str(row_text, left_w)
-                if entry_idx == self.selected_idx:
-                    left_cell = f"{BG_BLUE}{FG_WHITE}{BOLD}{row_text}{RESET}"
+            if row_idx < len(self.display_rows):
+                kind, payload = self.display_rows[row_idx]
+                if kind == "folder":
+                    key, count = payload  # type: ignore[misc]
+                    arrow = "▸" if key in self.collapsed_folders else "▾"
+                    folder_text = clip_str(f" {arrow} {key} ({count})", left_w)
+                    if row_idx == self.selected_idx:
+                        left_cell = f"{BG_BLUE}{FG_WHITE}{BOLD}{folder_text}{RESET}"
+                    else:
+                        left_cell = f"{FG_YELLOW}{BOLD}{folder_text}{RESET}"
+                    self.hitboxes.append((screen_y, 1, left_w, f"folder:{row_idx}:{key}"))
                 else:
-                    left_cell = row_text
-                self.hitboxes.append((screen_y, 1, left_w, f"select:{entry_idx}"))
+                    e: ClipEntry = payload  # type: ignore[assignment]
+                    pin_mark = "★" if e.pinned else " "
+                    branch_tag = f"[{e.git_branch[:10]}]" if e.git_branch else ""
+                    meta = f"{pin_mark}{e.short_time} {branch_tag}".strip()
+                    avail = max(6, left_w - len(meta) - 3)
+                    row_text = f"  {meta} {clip_str(e.preview, avail)}"
+                    row_text = clip_str(row_text, left_w)
+                    if row_idx == self.selected_idx:
+                        left_cell = f"{BG_BLUE}{FG_WHITE}{BOLD}{row_text}{RESET}"
+                    else:
+                        left_cell = row_text
+                    self.hitboxes.append((screen_y, 1, left_w, f"select:{row_idx}"))
             else:
                 left_cell = " " * left_w
 
@@ -320,7 +388,7 @@ class TimeTravelTUI:
 
         # Bottom divider & status bar
         buf.append(f"\x1b[{rows - 1};1H{FG_GRAY}{'─' * left_w}┴{'─' * right_w}{RESET}")
-        hints = " ↑↓/j/k:Nav  Enter:Copy  /:Search  Tab:Filter  p:Pin  d:Del  q:Quit | Mouse: Click/Wheel"
+        hints = " ↑↓/j/k:Nav  Enter:Copy  /:Search  Tab:Filter  g:Group  p:Pin  d:Del  q:Quit"
         status = f" {FG_CYAN}{self.status_msg}{RESET} |{FG_GRAY}{hints}{RESET}"
         buf.append(f"\x1b[{rows};1H\x1b[2K{status}")
 
@@ -338,8 +406,8 @@ class TimeTravelTUI:
             self.selected_idx = max(0, self.selected_idx - 1)
             return
         if btn == 65:  # Wheel down
-            if self.entries:
-                self.selected_idx = min(len(self.entries) - 1, self.selected_idx + 1)
+            if self.display_rows:
+                self.selected_idx = min(len(self.display_rows) - 1, self.selected_idx + 1)
             return
 
         if kind != "M" or btn != 0:
@@ -357,6 +425,17 @@ class TimeTravelTUI:
                     self.toggle_pin_selected()
                 elif action == "delete":
                     self.delete_selected()
+                elif action == "group":
+                    self.cycle_group_mode()
+                elif action.startswith("folder:"):
+                    self.search_mode = False
+                    _, idx_s, key = action.split(":", 2)
+                    self.selected_idx = int(idx_s)
+                    if key in self.collapsed_folders:
+                        self.collapsed_folders.remove(key)
+                    else:
+                        self.collapsed_folders.add(key)
+                    self._rebuild_display_rows()
                 elif action.startswith("filter:"):
                     self.filter_mode = action.split(":", 1)[1]
                     self.refresh_entries()
@@ -394,8 +473,8 @@ class TimeTravelTUI:
         elif key in ("\x1b[A", "k"):
             self.selected_idx = max(0, self.selected_idx - 1)
         elif key in ("\x1b[B", "j"):
-            if self.entries:
-                self.selected_idx = min(len(self.entries) - 1, self.selected_idx + 1)
+            if self.display_rows:
+                self.selected_idx = min(len(self.display_rows) - 1, self.selected_idx + 1)
         elif key in ("\r", "\n"):
             self.copy_selected()
         elif key == "/":
@@ -404,6 +483,8 @@ class TimeTravelTUI:
             order = ["all", "pinned", "branch"]
             self.filter_mode = order[(order.index(self.filter_mode) + 1) % len(order)]
             self.refresh_entries()
+        elif key == "g":
+            self.cycle_group_mode()
         elif key == "p":
             self.toggle_pin_selected()
         elif key == "d":
